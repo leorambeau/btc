@@ -135,47 +135,60 @@ class PolymarketClient:
 
     def find_btc_5min_markets(self, limit: int = 10) -> list[MarketPrice]:
         """
-        Trouve les marchés BTC actifs via l'API Gamma.
-        Priorité aux marchés "5 min" si disponibles, sinon tous les marchés BTC actifs.
+        Trouve le marché BTC Up/Down 5-min actif sur Polymarket.
+
+        Pattern slug : btc-updown-5m-{unix_timestamp}
+        Un nouveau marché est créé toutes les 5 minutes.
+        On cherche la fenêtre courante, puis les 2 fenêtres suivantes
+        (le marché peut être publié quelques secondes avant son début).
 
         Returns:
-            Liste de MarketPrice triée par liquidité décroissante
+            Liste de MarketPrice (1 ou 2 marchés actifs typiquement)
         """
+        import math
+
         markets = []
+        now     = datetime.now(timezone.utc)
 
-        try:
-            # Recherche via l'API Gamma (catalogue des marchés)
-            params = {
-                "active":   "true",
-                "closed":   "false",
-                "archived": "false",
-                "limit":    200,
-            }
-            resp = self._session.get(
-                f"{POLY_GAMMA_URL}/markets",
-                params=params,
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        # Calculer les timestamps des fenêtres courante + 2 suivantes
+        current_5m_ts = int(math.floor(now.timestamp() / 300) * 300)
+        slugs_to_try  = [
+            f"btc-updown-5m-{current_5m_ts}",
+            f"btc-updown-5m-{current_5m_ts + 300}",
+            f"btc-updown-5m-{current_5m_ts - 300}",  # fenêtre précédente si pas encore résolue
+        ]
 
-            for m in data:
-                q = m.get("question", "").lower()
-                if "btc" in q or "bitcoin" in q:
-                    price_obj = self._parse_market_price(m)
-                    if price_obj:
-                        markets.append(price_obj)
+        for slug in slugs_to_try:
+            try:
+                resp = self._session.get(
+                    f"{POLY_GAMMA_URL}/markets",
+                    params={"slug": slug},
+                    timeout=5,
+                )
+                if not resp.ok:
+                    continue
 
-            # Trier par liquidité décroissante
-            markets.sort(key=lambda x: float(x.spread), reverse=False)
+                data = resp.json()
+                if not data:
+                    continue
 
-            if markets:
-                logger.info(f"[Poly] {len(markets)} marchés BTC actifs trouvés")
-            else:
-                logger.warning("[Poly] Aucun marché BTC actif — aucun filtre 5-min appliqué")
+                m = data[0]
+                if m.get("closed") or m.get("archived"):
+                    continue
 
-        except requests.RequestException as e:
-            logger.error(f"[Poly] Erreur recherche marchés: {e}")
+                price_obj = self._parse_market_price(m)
+                if price_obj and price_obj not in markets:
+                    markets.append(price_obj)
+                    logger.info(
+                        f"[Poly] Marché 5min: {m.get('question', '')}"
+                        f" — YES={price_obj.yes_price:.3f} NO={price_obj.no_price:.3f}"
+                    )
+
+            except requests.RequestException as e:
+                logger.debug(f"[Poly] Slug {slug} introuvable: {e}")
+
+        if not markets:
+            logger.warning("[Poly] Aucun marché BTC 5-min trouvé pour cette fenêtre")
 
         return markets[:limit]
 
