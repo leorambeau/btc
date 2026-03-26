@@ -212,7 +212,9 @@ def _polymarket_poller(state: EngineState, client: PolymarketClient, poll_interv
     1. Trouver/rafraîchir le marché BTC 5-min actif
     2. Mettre à jour le prix YES/NO
     """
-    current_market_id = None
+    current_market_id    = None
+    current_yes_token_id = None
+    current_gamma_id     = None
 
     while state.running:
         try:
@@ -221,7 +223,9 @@ def _polymarket_poller(state: EngineState, client: PolymarketClient, poll_interv
                 markets = client.find_btc_5min_markets(limit=1)
                 if markets:
                     market = markets[0]
-                    current_market_id = market.condition_id
+                    current_market_id    = market.condition_id
+                    current_yes_token_id = market.yes_token_id
+                    current_gamma_id     = market.market_id   # ID numérique Gamma
                     state.update_poly_price(market)
                     logger.info(
                         f"[Poly] Marché: {market.question[:50]}"
@@ -231,8 +235,12 @@ def _polymarket_poller(state: EngineState, client: PolymarketClient, poll_interv
                     logger.debug("[Poly] Aucun marché actif trouvé")
 
             elif current_market_id:
-                # Rafraîchir le prix du marché courant
-                price_obj = client.get_market_price(current_market_id)
+                # Rafraîchir le prix (CLOB en priorité, Gamma en fallback)
+                price_obj = client.get_market_price(
+                    current_market_id,
+                    current_yes_token_id or "",
+                    current_gamma_id     or "",
+                )
                 if price_obj:
                     if state.active_market:
                         price_obj.question     = state.active_market.question

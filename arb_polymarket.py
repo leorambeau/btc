@@ -135,8 +135,8 @@ class PolymarketClient:
 
     def find_btc_5min_markets(self, limit: int = 10) -> list[MarketPrice]:
         """
-        Trouve les marchés BTC "5 min" actifs via l'API Gamma.
-        Filtre : résolution Chainlink BTC/USD, marchés non résolus.
+        Trouve les marchés BTC actifs via l'API Gamma.
+        Priorité aux marchés "5 min" si disponibles, sinon tous les marchés BTC actifs.
 
         Returns:
             Liste de MarketPrice triée par liquidité décroissante
@@ -146,10 +146,10 @@ class PolymarketClient:
         try:
             # Recherche via l'API Gamma (catalogue des marchés)
             params = {
-                "tag":    "Crypto",
-                "active": "true",
-                "closed": "false",
-                "limit":  50,
+                "active":   "true",
+                "closed":   "false",
+                "archived": "false",
+                "limit":    200,
             }
             resp = self._session.get(
                 f"{POLY_GAMMA_URL}/markets",
@@ -161,60 +161,89 @@ class PolymarketClient:
 
             for m in data:
                 q = m.get("question", "").lower()
-                # Filtre: marchés BTC 5 min avec résolution Chainlink
-                if ("btc" in q or "bitcoin" in q) and ("5 min" in q or "5min" in q or "5-min" in q):
+                if "btc" in q or "bitcoin" in q:
                     price_obj = self._parse_market_price(m)
                     if price_obj:
                         markets.append(price_obj)
 
-            logger.info(f"[Poly] {len(markets)} marchés BTC 5-min trouvés")
+            # Trier par liquidité décroissante
+            markets.sort(key=lambda x: float(x.spread), reverse=False)
+
+            if markets:
+                logger.info(f"[Poly] {len(markets)} marchés BTC actifs trouvés")
+            else:
+                logger.warning("[Poly] Aucun marché BTC actif — aucun filtre 5-min appliqué")
 
         except requests.RequestException as e:
             logger.error(f"[Poly] Erreur recherche marchés: {e}")
 
         return markets[:limit]
 
-    def get_market_price(self, condition_id: str) -> Optional[MarketPrice]:
+    def get_market_price(self, condition_id: str, yes_token_id: str = "", gamma_market_id: str = "") -> Optional[MarketPrice]:
         """
-        Récupère le prix actuel d'un marché via le CLOB.
+        Récupère le prix actuel d'un marché.
+        Priorité : CLOB /book (si yes_token_id fourni) → Gamma /markets/{id}
 
         Args:
-            condition_id: ID de condition du marché
+            condition_id:    ID de condition du marché (0x...)
+            yes_token_id:    Token ID numérique du outcome YES (depuis clobTokenIds)
+            gamma_market_id: ID numérique Gamma (ex: "540844") pour le fallback REST
 
         Returns:
             MarketPrice avec les meilleures offres bid/ask pour YES/NO
         """
-        try:
-            url  = f"{POLY_CLOB_URL}/book"
-            t0   = time.perf_counter()
-            resp = self._session.get(url, params={"token_id": condition_id}, timeout=5)
-            latency_ms = (time.perf_counter() - t0) * 1000
+        # Tentative via CLOB si on a un vrai token_id numérique
+        if yes_token_id:
+            try:
+                url = f"{POLY_CLOB_URL}/book"
+                t0  = time.perf_counter()
+                resp = self._session.get(url, params={"token_id": yes_token_id}, timeout=5)
+                latency_ms = (time.perf_counter() - t0) * 1000
 
-            if latency_ms > RELAYER_TIMEOUT_MS:
-                logger.warning(f"[Poly] Latence CLOB: {latency_ms:.0f}ms (seuil: {RELAYER_TIMEOUT_MS}ms)")
+                if latency_ms > RELAYER_TIMEOUT_MS:
+                    logger.warning(f"[Poly] Latence CLOB: {latency_ms:.0f}ms")
 
-            resp.raise_for_status()
-            book = resp.json()
+                if resp.ok:
+                    book      = resp.json()
+                    yes_price = self._mid_price(book.get("bids", []), book.get("asks", []))
+                    no_price  = 1.0 - yes_price if yes_price else 0.5
+                    spread    = self._bid_ask_spread(book)
 
-            yes_price = self._mid_price(book.get("bids", []), book.get("asks", []))
-            no_price  = 1.0 - yes_price if yes_price else 0.5
-            spread    = self._bid_ask_spread(book)
+                    # Si le spread est > 40% (carnet synthétique sans vraie liquidité),
+                    # le mid-price est peu fiable — ne pas retourner ce résultat
+                    if spread > 0.40:
+                        logger.debug(f"[Poly] CLOB spread trop large ({spread:.2f}), fallback Gamma")
+                    else:
+                        return MarketPrice(
+                            market_id    = condition_id,
+                            condition_id = condition_id,
+                            yes_token_id = yes_token_id,
+                            no_token_id  = "",
+                            yes_price    = yes_price,
+                            no_price     = no_price,
+                            spread       = spread,
+                            timestamp    = datetime.now(timezone.utc),
+                            question     = "",
+                        )
+            except Exception as e:
+                logger.warning(f"[Poly] CLOB book failed, fallback Gamma: {e}")
 
-            return MarketPrice(
-                market_id    = condition_id,
-                condition_id = condition_id,
-                yes_token_id = "",
-                no_token_id  = "",
-                yes_price    = yes_price,
-                no_price     = no_price,
-                spread       = spread,
-                timestamp    = datetime.now(timezone.utc),
-                question     = "",
-            )
+        # Fallback : récupérer les prix depuis la Gamma API via l'ID numérique
+        if gamma_market_id:
+            try:
+                resp = self._session.get(
+                    f"{POLY_GAMMA_URL}/markets/{gamma_market_id}",
+                    timeout=5,
+                )
+                if resp.ok:
+                    m = resp.json()
+                    price_obj = self._parse_market_price(m)
+                    if price_obj:
+                        return price_obj
+            except Exception as e:
+                logger.error(f"[Poly] get_market_price Gamma fallback error: {e}")
 
-        except Exception as e:
-            logger.error(f"[Poly] get_market_price error: {e}")
-            return None
+        return None
 
     # ─── Placement d'ordre ────────────────────────────────────────────────────
 
@@ -430,27 +459,53 @@ class PolymarketClient:
 
     @staticmethod
     def _parse_market_price(m: dict) -> Optional[MarketPrice]:
-        """Parse un market Gamma en MarketPrice."""
-        try:
-            tokens    = m.get("tokens", [])
-            yes_token = next((t for t in tokens if t.get("outcome", "").upper() == "YES"), None)
-            no_token  = next((t for t in tokens if t.get("outcome", "").upper() == "NO"),  None)
+        """
+        Parse un market Gamma en MarketPrice.
 
-            yes_price = float(yes_token["price"]) if yes_token else 0.5
-            no_price  = float(no_token["price"])  if no_token  else 1.0 - yes_price
+        La Gamma API retourne les prix dans outcomePrices (liste JSON stringifiée)
+        et les token IDs CLOB dans clobTokenIds.
+        outcomes[0] = "Yes", outcomes[1] = "No" (ordre conventionnel).
+        """
+        try:
+            import json as _json
+
+            # Prix : outcomePrices est une liste JSON comme '["0.4845", "0.5155"]'
+            raw_prices = m.get("outcomePrices", "[]")
+            if isinstance(raw_prices, str):
+                prices = _json.loads(raw_prices)
+            else:
+                prices = raw_prices  # déjà une liste
+
+            yes_price = float(prices[0]) if len(prices) > 0 else 0.5
+            no_price  = float(prices[1]) if len(prices) > 1 else 1.0 - yes_price
+
+            # Token IDs CLOB (nécessaires pour l'endpoint /book)
+            raw_token_ids = m.get("clobTokenIds", "[]")
+            if isinstance(raw_token_ids, str):
+                token_ids = _json.loads(raw_token_ids)
+            else:
+                token_ids = raw_token_ids or []
+
+            yes_token_id = token_ids[0] if len(token_ids) > 0 else ""
+            no_token_id  = token_ids[1] if len(token_ids) > 1 else ""
+
+            # Spread : utiliser le champ Gamma si dispo, sinon calcul
+            spread_raw = m.get("spread")
+            spread = float(spread_raw) if spread_raw is not None else abs(yes_price + no_price - 1.0)
 
             return MarketPrice(
-                market_id    = m.get("id",              ""),
-                condition_id = m.get("conditionId",     ""),
-                yes_token_id = yes_token["tokenId"] if yes_token else "",
-                no_token_id  = no_token["tokenId"]  if no_token  else "",
+                market_id    = m.get("id",          ""),
+                condition_id = m.get("conditionId", ""),
+                yes_token_id = yes_token_id,
+                no_token_id  = no_token_id,
                 yes_price    = yes_price,
                 no_price     = no_price,
-                spread       = abs(yes_price + no_price - 1.0),
+                spread       = spread,
                 timestamp    = datetime.now(timezone.utc),
                 question     = m.get("question", ""),
             )
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[Poly] _parse_market_price error: {e}")
             return None
 
 
