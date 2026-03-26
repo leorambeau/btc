@@ -1,0 +1,33 @@
+# ─── Existant ─────────────────────────────────────────────
+websockets>=12.0
+plotly>=5.18.0
+pyqtgraph>=0.13.7
+PyQt5>=5.15.9
+numpy>=1.24.3
+ipython>=8.18.1
+dash>=2.14.2
+flask>=3.0.0
+
+# ─── Arbitrage HFT (nouveaux) ─────────────────────────────
+# ML
+xgboost>=2.0.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
+
+# Données async
+aiohttp>=3.9.0
+pandas>=2.0.0
+pyarrow>=14.0.0          # Format parquet (stockage efficace)
+
+# Polymarket CLOB
+py-clob-client>=0.11.0   # Client officiel Polymarket
+
+# Signature EIP-712 / Ethereum
+web3>=6.0.0              # eth_account inclus
+
+# Dashboard amélioré
+dash-bootstrap-components>=1.5.0
+
+# Utilitaires
+python-dotenv>=1.0.0     # Chargement .env
+requests>=2.31.0
